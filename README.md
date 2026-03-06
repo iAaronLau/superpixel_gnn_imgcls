@@ -8,6 +8,8 @@ Runnable baseline for image classification with:
 - Two training backends: `accelerate` and `transformers.Trainer`
 - Default training backend: `transformers.Trainer` (HF ecosystem first)
 - Optional logging with `wandb`
+- W&B classification metrics: AUC / PR-AUC / F1 / Precision / Recall / MCC / Kappa
+- W&B plots: confusion matrix, ROC curve, PR curve, per-class metric table
 - Checkpoint save/load/resume (`--resume`)
 - Optional push to Hugging Face Hub
 - SLURM submission scripts

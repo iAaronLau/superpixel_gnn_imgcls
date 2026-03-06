@@ -22,6 +22,12 @@ from data_utils.graph_dataset import GraphBuildConfig, HFGraphDataset
 from data_utils.image_dataset import HFImageDataset, build_image_transform
 from models import build_model
 from utils.checkpoint import load_checkpoint, save_checkpoint, update_latest_symlink
+from utils.classification_metrics import (
+    compute_classification_metrics,
+    log_wandb_classification_artifacts,
+    logits_to_probs,
+    prefix_metrics,
+)
 from utils.io import append_result_row, dump_config, ensure_dir
 from utils.metrics import batch_stats, count_parameters
 from utils.seed import set_global_seed
@@ -319,6 +325,56 @@ def step_epoch(model, loader, criterion, accelerator: Accelerator, optimizer=Non
     return mean_loss, mean_acc
 
 
+def evaluate_with_predictions(model, loader, criterion, accelerator: Accelerator, is_graph=False):
+    model.eval()
+    loss_total = 0.0
+    correct_total = 0.0
+    sample_total = 0.0
+
+    all_logits = [] if accelerator.is_main_process else None
+    all_labels = [] if accelerator.is_main_process else None
+
+    with torch.no_grad():
+        for batch in loader:
+            if is_graph:
+                labels = batch.y.view(-1)
+                logits = model(batch)
+            else:
+                images, labels = batch
+                logits = model(images)
+
+            loss = criterion(logits, labels)
+
+            correct, total = batch_stats(logits, labels)
+            loss_sum = loss.detach().float() * float(labels.size(0))
+
+            gathered_loss = accelerator.gather_for_metrics(loss_sum.unsqueeze(0)).sum().item()
+            gathered_correct = accelerator.gather_for_metrics(correct.unsqueeze(0)).sum().item()
+            gathered_total = accelerator.gather_for_metrics(total.unsqueeze(0)).sum().item()
+
+            loss_total += gathered_loss
+            correct_total += gathered_correct
+            sample_total += gathered_total
+
+            gathered_logits = accelerator.gather_for_metrics(logits.detach())
+            gathered_labels = accelerator.gather_for_metrics(labels.detach())
+            if accelerator.is_main_process:
+                all_logits.append(gathered_logits.cpu())
+                all_labels.append(gathered_labels.cpu())
+
+    mean_loss = loss_total / max(sample_total, 1.0)
+    mean_acc = correct_total / max(sample_total, 1.0)
+
+    labels_np = None
+    probs_np = None
+    if accelerator.is_main_process and all_logits and all_labels:
+        logits_np = torch.cat(all_logits, dim=0).numpy()
+        labels_np = torch.cat(all_labels, dim=0).numpy()
+        probs_np = logits_to_probs(logits_np)
+
+    return mean_loss, mean_acc, labels_np, probs_np
+
+
 def _resolve_resume_for_accelerate(resume_arg: str, run_dir: str):
     if not resume_arg:
         return None
@@ -405,6 +461,10 @@ def run_accelerate_training(args, bundle: DatasetBundle, run_dir: str):
 
     epoch_times = []
     is_graph = args.model in GRAPH_MODELS
+    class_names = bundle.class_names
+    best_val_labels = None
+    best_val_probs = None
+    best_val_per_class = None
 
     for epoch in range(start_epoch, args.epochs):
         t0 = time.perf_counter()
@@ -419,14 +479,18 @@ def run_accelerate_training(args, bundle: DatasetBundle, run_dir: str):
             grad_clip=args.grad_clip,
         )
 
-        val_loss, val_acc = step_epoch(
+        val_loss, val_acc, val_labels, val_probs = evaluate_with_predictions(
             model=model,
             loader=val_loader,
             criterion=criterion,
             accelerator=accelerator,
-            optimizer=None,
             is_graph=is_graph,
         )
+
+        val_cls_metrics = {}
+        val_per_class = []
+        if accelerator.is_main_process and val_labels is not None and val_probs is not None:
+            val_cls_metrics, val_per_class = compute_classification_metrics(val_labels, val_probs)
 
         if scheduler is not None:
             scheduler.step()
@@ -442,18 +506,17 @@ def run_accelerate_training(args, bundle: DatasetBundle, run_dir: str):
                 f"time={elapsed:.1f}s"
             )
             if wandb_run is not None:
-                wandb_run.log(
-                    {
-                        "epoch": epoch + 1,
-                        "train/loss": train_loss,
-                        "train/acc": train_acc,
-                        "val/loss": val_loss,
-                        "val/acc": val_acc,
-                        "time/epoch_sec": elapsed,
-                        "lr": optimizer.param_groups[0]["lr"],
-                    },
-                    step=epoch + 1,
-                )
+                payload = {
+                    "epoch": epoch + 1,
+                    "train/loss": train_loss,
+                    "train/acc": train_acc,
+                    "val/loss": val_loss,
+                    "val/acc": val_acc,
+                    "time/epoch_sec": elapsed,
+                    "lr": optimizer.param_groups[0]["lr"],
+                }
+                payload.update(prefix_metrics(val_cls_metrics, "val_cls"))
+                wandb_run.log(payload, step=epoch + 1)
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -470,33 +533,63 @@ def run_accelerate_training(args, bundle: DatasetBundle, run_dir: str):
                     accelerator=accelerator,
                 )
                 update_latest_symlink(run_dir, best_ckpt_path)
+                if val_labels is not None and val_probs is not None:
+                    best_val_labels = val_labels.copy()
+                    best_val_probs = val_probs.copy()
+                    best_val_per_class = list(val_per_class)
 
         accelerator.wait_for_everyone()
 
     if os.path.exists(best_ckpt_path):
         load_checkpoint(best_ckpt_path, model=model, optimizer=None, scheduler=None, accelerator=accelerator)
 
-    test_loss, test_acc = step_epoch(
+    test_loss, test_acc, test_labels, test_probs = evaluate_with_predictions(
         model=model,
         loader=test_loader,
         criterion=criterion,
         accelerator=accelerator,
-        optimizer=None,
         is_graph=is_graph,
     )
+
+    test_cls_metrics = {}
+    test_per_class = []
+    if accelerator.is_main_process and test_labels is not None and test_probs is not None:
+        test_cls_metrics, test_per_class = compute_classification_metrics(test_labels, test_probs)
 
     avg_epoch_time = sum(epoch_times) / max(1, len(epoch_times))
 
     if accelerator.is_main_process and wandb_run is not None:
-        wandb_run.log(
-            {
-                "best/val_acc": best_val_acc,
-                "test/loss": test_loss,
-                "test/acc": test_acc,
-                "model/params": num_params,
-                "time/avg_epoch_sec": avg_epoch_time,
-            }
-        )
+        payload = {
+            "best/val_acc": best_val_acc,
+            "test/loss": test_loss,
+            "test/acc": test_acc,
+            "model/params": num_params,
+            "time/avg_epoch_sec": avg_epoch_time,
+        }
+        payload.update(prefix_metrics(test_cls_metrics, "test_cls"))
+        wandb_run.log(payload)
+
+        if test_labels is not None and test_probs is not None:
+            log_wandb_classification_artifacts(
+                wandb_run,
+                prefix="test_cls",
+                labels=test_labels,
+                probs=test_probs,
+                class_names=class_names,
+                per_class_rows=test_per_class,
+                step=args.epochs,
+            )
+        if best_val_labels is not None and best_val_probs is not None:
+            log_wandb_classification_artifacts(
+                wandb_run,
+                prefix="best_val_cls",
+                labels=best_val_labels,
+                probs=best_val_probs,
+                class_names=class_names,
+                per_class_rows=best_val_per_class,
+                step=args.epochs,
+            )
+
         wandb_run.summary["best_checkpoint"] = best_ckpt_path
         wandb_run.finish()
 

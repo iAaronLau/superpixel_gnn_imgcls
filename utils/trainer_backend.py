@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import time
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,15 +16,13 @@ from data_utils.graph_dataset import GraphBuildConfig, HFGraphDataset
 from data_utils.image_dataset import HFImageDictDataset, build_image_transform
 from models import build_model
 from utils.checkpoint import update_latest_symlink
+from utils.classification_metrics import (
+    compute_classification_metrics,
+    log_wandb_classification_artifacts,
+    logits_to_probs,
+    prefix_metrics,
+)
 from utils.metrics import count_parameters
-
-try:
-    import evaluate
-
-    _EVALUATE_AVAILABLE = True
-except Exception:  # noqa: PERF203
-    evaluate = None
-    _EVALUATE_AVAILABLE = False
 
 try:
     from transformers import PreTrainedModel, PretrainedConfig, Trainer, TrainerCallback, TrainingArguments
@@ -236,23 +235,13 @@ def graph_data_collator(features):
 
 
 def build_compute_metrics_fn():
-    if _EVALUATE_AVAILABLE:
-        metric = evaluate.load("accuracy")
-
-        def _metrics(eval_pred):
-            logits, labels = eval_pred
-            preds = np.argmax(logits, axis=-1)
-            return metric.compute(predictions=preds, references=labels)
-
-        return _metrics
-
-    def _fallback(eval_pred):
+    def _metrics(eval_pred):
         logits, labels = eval_pred
-        preds = np.argmax(logits, axis=-1)
-        acc = float((preds == labels).mean())
-        return {"accuracy": acc}
+        probs = logits_to_probs(np.asarray(logits))
+        metrics, _ = compute_classification_metrics(np.asarray(labels), probs)
+        return metrics
 
-    return _fallback
+    return _metrics
 
 
 class HFGraphTrainer(Trainer):
@@ -428,9 +417,32 @@ def run_transformers_training(args, bundle, run_dir: str):
         hub_token=hub_token,
     )
 
+    def _build_training_args_compatible(kwargs: dict):
+        sig = inspect.signature(TrainingArguments.__init__)
+        supported = set(sig.parameters.keys())
+        adapted = dict(kwargs)
+
+        # Transformers versions may use either `evaluation_strategy` or `eval_strategy`.
+        if "evaluation_strategy" in adapted and "evaluation_strategy" not in supported and "eval_strategy" in supported:
+            adapted["eval_strategy"] = adapted.pop("evaluation_strategy")
+        if "eval_strategy" in adapted and "eval_strategy" not in supported and "evaluation_strategy" in supported:
+            adapted["evaluation_strategy"] = adapted.pop("eval_strategy")
+
+        removed = []
+        for key in list(adapted.keys()):
+            if key not in supported:
+                removed.append(key)
+                adapted.pop(key)
+
+        if removed:
+            print(f"[WARN] Dropping unsupported TrainingArguments keys: {sorted(removed)}")
+
+        return TrainingArguments(**adapted)
+
     try:
-        training_args = TrainingArguments(**training_kwargs)
+        training_args = _build_training_args_compatible(training_kwargs)
     except TypeError as exc:
+        # Final defensive pass for corner cases in very old/new versions.
         print(f"[WARN] TrainingArguments fallback due to version mismatch: {exc}")
         for key in [
             "dataloader_persistent_workers",
@@ -440,9 +452,11 @@ def run_transformers_training(args, bundle, run_dir: str):
             "hub_private_repo",
             "hub_strategy",
             "hub_token",
+            "evaluation_strategy",
+            "eval_strategy",
         ]:
             training_kwargs.pop(key, None)
-        training_args = TrainingArguments(**training_kwargs)
+        training_args = _build_training_args_compatible(training_kwargs)
 
     timer_cb = EpochTimerCallback()
     callbacks = [LatestCheckpointCallback(), timer_cb]
@@ -468,8 +482,17 @@ def run_transformers_training(args, bundle, run_dir: str):
     train_elapsed = time.perf_counter() - train_start
 
     val_metrics = trainer.evaluate(eval_dataset=val_ds, metric_key_prefix="val")
+    val_output = trainer.predict(val_ds, metric_key_prefix="val_final")
     test_output = trainer.predict(test_ds, metric_key_prefix="test")
     test_metrics = test_output.metrics
+
+    val_labels = np.asarray(val_output.label_ids)
+    val_probs = logits_to_probs(np.asarray(val_output.predictions))
+    val_cls_metrics, val_per_class = compute_classification_metrics(val_labels, val_probs)
+
+    test_labels = np.asarray(test_output.label_ids)
+    test_probs = logits_to_probs(np.asarray(test_output.predictions))
+    test_cls_metrics, test_per_class = compute_classification_metrics(test_labels, test_probs)
 
     num_params = count_parameters(trainer.model)
     best_ckpt = trainer.state.best_model_checkpoint
@@ -495,7 +518,43 @@ def run_transformers_training(args, bundle, run_dir: str):
     )
 
     test_acc = test_metrics.get("test_accuracy", float("nan"))
+    if isinstance(test_acc, float) and np.isnan(test_acc):
+        test_acc = test_cls_metrics.get("accuracy", float("nan"))
     test_loss = test_metrics.get("test_loss", float("nan"))
+
+    if args.use_wandb and args.wandb_mode != "disabled" and trainer.is_world_process_zero():
+        try:
+            import wandb
+
+            wandb_run = wandb.run
+        except Exception:  # noqa: PERF203
+            wandb_run = None
+
+        if wandb_run is not None:
+            payload = {}
+            payload.update(prefix_metrics(val_cls_metrics, "val_final_cls"))
+            payload.update(prefix_metrics(test_cls_metrics, "test_cls"))
+            if payload:
+                wandb_run.log(payload, step=trainer.state.global_step)
+
+            log_wandb_classification_artifacts(
+                wandb_run,
+                prefix="val_final_cls",
+                labels=val_labels,
+                probs=val_probs,
+                class_names=bundle.class_names,
+                per_class_rows=val_per_class,
+                step=trainer.state.global_step,
+            )
+            log_wandb_classification_artifacts(
+                wandb_run,
+                prefix="test_cls",
+                labels=test_labels,
+                probs=test_probs,
+                class_names=bundle.class_names,
+                per_class_rows=test_per_class,
+                step=trainer.state.global_step,
+            )
 
     return {
         "is_main_process": trainer.is_world_process_zero(),

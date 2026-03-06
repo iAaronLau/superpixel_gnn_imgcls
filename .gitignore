@@ -86,5 +86,5 @@ metrics_*
 *.gz
 *.pjs
 
-
+outputs/
 graph_cache/
