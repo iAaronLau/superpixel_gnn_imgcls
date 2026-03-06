@@ -78,6 +78,7 @@ def parse_args():
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--gnn_layers", type=int, default=3)
     parser.add_argument("--gat_heads", type=int, default=4)
+    parser.add_argument("--resnet_name", type=str, default="resnet18", choices=["resnet18", "resnet34"])
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--pooling", type=str, default="mean", choices=["mean", "add"])
     parser.add_argument("--grad_clip", type=float, default=0.0)
@@ -86,6 +87,16 @@ def parse_args():
     parser.add_argument("--persistent_workers", type=int, default=1)
     parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"])
+    parser.add_argument("--allow_tf32", type=int, default=1)
+    parser.add_argument("--cudnn_benchmark", type=int, default=1)
+    parser.add_argument("--channels_last", type=int, default=1)
+    parser.add_argument("--torch_compile", type=int, default=0)
+    parser.add_argument(
+        "--torch_compile_mode",
+        type=str,
+        default="reduce-overhead",
+        choices=["default", "reduce-overhead", "max-autotune"],
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--ddp_find_unused_parameters", type=int, default=0)
 
@@ -129,6 +140,26 @@ def _default_image_size(args) -> int:
     if args.image_size is not None:
         return args.image_size
     return 64 if args.dataset == "cifar10" else 224
+
+
+def configure_torch_runtime(args):
+    if not torch.cuda.is_available():
+        return
+
+    allow_tf32 = bool(args.allow_tf32)
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+    except Exception:  # noqa: PERF203
+        pass
+
+    try:
+        torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
+    except Exception:  # noqa: PERF203
+        pass
+
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
 
 
 def _subset_split(split: Dataset, max_samples: int, seed: int) -> Dataset:
@@ -269,7 +300,16 @@ def create_scheduler(args, optimizer):
     return None
 
 
-def step_epoch(model, loader, criterion, accelerator: Accelerator, optimizer=None, is_graph=False, grad_clip=0.0):
+def step_epoch(
+    model,
+    loader,
+    criterion,
+    accelerator: Accelerator,
+    optimizer=None,
+    is_graph=False,
+    grad_clip=0.0,
+    use_channels_last=False,
+):
     is_train = optimizer is not None
     if is_train:
         model.train()
@@ -291,6 +331,8 @@ def step_epoch(model, loader, criterion, accelerator: Accelerator, optimizer=Non
                         logits = model(batch)
                     else:
                         images, labels = batch
+                        if use_channels_last and images.ndim == 4:
+                            images = images.contiguous(memory_format=torch.channels_last)
                         logits = model(images)
 
                     loss = criterion(logits, labels)
@@ -306,6 +348,8 @@ def step_epoch(model, loader, criterion, accelerator: Accelerator, optimizer=Non
                     logits = model(batch)
                 else:
                     images, labels = batch
+                    if use_channels_last and images.ndim == 4:
+                        images = images.contiguous(memory_format=torch.channels_last)
                     logits = model(images)
                 loss = criterion(logits, labels)
 
@@ -325,7 +369,7 @@ def step_epoch(model, loader, criterion, accelerator: Accelerator, optimizer=Non
     return mean_loss, mean_acc
 
 
-def evaluate_with_predictions(model, loader, criterion, accelerator: Accelerator, is_graph=False):
+def evaluate_with_predictions(model, loader, criterion, accelerator: Accelerator, is_graph=False, use_channels_last=False):
     model.eval()
     loss_total = 0.0
     correct_total = 0.0
@@ -341,6 +385,8 @@ def evaluate_with_predictions(model, loader, criterion, accelerator: Accelerator
                 logits = model(batch)
             else:
                 images, labels = batch
+                if use_channels_last and images.ndim == 4:
+                    images = images.contiguous(memory_format=torch.channels_last)
                 logits = model(images)
 
             loss = criterion(logits, labels)
@@ -426,6 +472,18 @@ def run_accelerate_training(args, bundle: DatasetBundle, run_dir: str):
     train_loader, val_loader, test_loader, node_feature_dim = build_dataloaders(args, bundle)
 
     model = build_model(args, num_classes=bundle.num_classes, node_feature_dim=node_feature_dim)
+    use_channels_last = bool(args.channels_last) and args.model == "resnet"
+    if use_channels_last:
+        model = model.to(memory_format=torch.channels_last)
+    if bool(args.torch_compile):
+        try:
+            model = torch.compile(model, mode=args.torch_compile_mode)
+            if accelerator.is_main_process:
+                print(f"[Perf] torch.compile enabled (mode={args.torch_compile_mode})")
+        except Exception as exc:  # noqa: PERF203
+            if accelerator.is_main_process:
+                print(f"[WARN] torch.compile disabled due to error: {exc}")
+
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = create_scheduler(args, optimizer)
     criterion = nn.CrossEntropyLoss()
@@ -477,6 +535,7 @@ def run_accelerate_training(args, bundle: DatasetBundle, run_dir: str):
             optimizer=optimizer,
             is_graph=is_graph,
             grad_clip=args.grad_clip,
+            use_channels_last=use_channels_last,
         )
 
         val_loss, val_acc, val_labels, val_probs = evaluate_with_predictions(
@@ -485,6 +544,7 @@ def run_accelerate_training(args, bundle: DatasetBundle, run_dir: str):
             criterion=criterion,
             accelerator=accelerator,
             is_graph=is_graph,
+            use_channels_last=use_channels_last,
         )
 
         val_cls_metrics = {}
@@ -549,6 +609,7 @@ def run_accelerate_training(args, bundle: DatasetBundle, run_dir: str):
         criterion=criterion,
         accelerator=accelerator,
         is_graph=is_graph,
+        use_channels_last=use_channels_last,
     )
 
     test_cls_metrics = {}
@@ -609,6 +670,7 @@ def main():
     args.image_size = _default_image_size(args)
 
     set_global_seed(args.seed)
+    configure_torch_runtime(args)
 
     run_tag = args.run_name.strip()
     if not run_tag:

@@ -113,3 +113,22 @@ Optional envs before submission:
 - `CONDA_SH`, `CONDA_ENV_NAME`
 - `PARTITION_NAME`, `GPUS_PER_NODE`, `NODES`, `CPUS_PER_TASK`
 - `WANDB_MODE` (`online`/`offline`)
+
+## Batch Experiments / Hyperparameter Sweep
+
+Use the built-in sweep launcher to run the requested experiment matrix with fixed seed/split and automatic logging:
+
+```bash
+python run_experiments.py \
+  --seed 42 \
+  --train_backend transformers \
+  --lr_grid 3e-4,1e-3 \
+  --batch_size_grid 16,32,64 \
+  --weight_decay_grid 1e-4
+```
+
+Useful controls:
+
+- `--dry_run`: print planned commands only
+- `--max_runs N`: cap total launched runs
+- `--retries K`: retry failed runs up to K times, then skip

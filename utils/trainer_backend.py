@@ -60,6 +60,8 @@ class SuperpixelConfig(PretrainedConfig):
         image_size: int = 64,
         num_labels: int = 10,
         node_feature_dim: int = 5,
+        resnet_name: str = "resnet18",
+        channels_last: bool = True,
         hidden_dim: int = 128,
         gnn_layers: int = 3,
         gat_heads: int = 4,
@@ -73,6 +75,8 @@ class SuperpixelConfig(PretrainedConfig):
         self.image_size = image_size
         self.num_labels = num_labels
         self.node_feature_dim = node_feature_dim
+        self.resnet_name = resnet_name
+        self.channels_last = channels_last
         self.hidden_dim = hidden_dim
         self.gnn_layers = gnn_layers
         self.gat_heads = gat_heads
@@ -90,6 +94,7 @@ class SuperpixelForImageClassification(PreTrainedModel):
             dataset=config.dataset_name,
             model=config.model_name,
             image_size=config.image_size,
+            resnet_name=config.resnet_name,
             hidden_dim=config.hidden_dim,
             gnn_layers=config.gnn_layers,
             gat_heads=config.gat_heads,
@@ -104,6 +109,8 @@ class SuperpixelForImageClassification(PreTrainedModel):
         if self.config.model_name == "resnet":
             if pixel_values is None:
                 raise ValueError("`pixel_values` is required for resnet model.")
+            if self.config.channels_last and pixel_values.ndim == 4:
+                pixel_values = pixel_values.contiguous(memory_format=torch.channels_last)
             logits = self.backbone(pixel_values)
         else:
             if graph_data is None:
@@ -321,6 +328,8 @@ def _build_hf_config(args, bundle, node_feature_dim: int | None) -> SuperpixelCo
         image_size=args.image_size,
         num_labels=bundle.num_classes,
         node_feature_dim=node_dim,
+        resnet_name=getattr(args, "resnet_name", "resnet18"),
+        channels_last=bool(getattr(args, "channels_last", 1)),
         hidden_dim=args.hidden_dim,
         gnn_layers=args.gnn_layers,
         gat_heads=args.gat_heads,
@@ -345,6 +354,8 @@ def run_transformers_training(args, bundle, run_dir: str):
 
     config = _build_hf_config(args, bundle, node_feature_dim)
     model = SuperpixelForImageClassification(config)
+    if args.model == "resnet" and bool(getattr(args, "channels_last", 1)):
+        model = model.to(memory_format=torch.channels_last)
 
     eval_strategy = args.eval_strategy
     save_strategy = args.save_strategy
@@ -415,6 +426,9 @@ def run_transformers_training(args, bundle, run_dir: str):
         hub_private_repo=bool(args.hub_private_repo),
         hub_strategy=args.hub_strategy,
         hub_token=hub_token,
+        torch_compile=bool(getattr(args, "torch_compile", 0)),
+        torch_compile_backend="inductor",
+        torch_compile_mode=getattr(args, "torch_compile_mode", "reduce-overhead"),
     )
 
     def _build_training_args_compatible(kwargs: dict):
@@ -457,6 +471,16 @@ def run_transformers_training(args, bundle, run_dir: str):
         ]:
             training_kwargs.pop(key, None)
         training_args = _build_training_args_compatible(training_kwargs)
+
+    if bool(getattr(args, "torch_compile", 0)) and not bool(getattr(training_args, "torch_compile", False)):
+        try:
+            model = torch.compile(model, mode=getattr(args, "torch_compile_mode", "reduce-overhead"))
+            print(
+                "[Perf] training_args has no torch_compile support; "
+                f"fallback to manual torch.compile(mode={getattr(args, 'torch_compile_mode', 'reduce-overhead')})"
+            )
+        except Exception as exc:  # noqa: PERF203
+            print(f"[WARN] manual torch.compile fallback disabled: {exc}")
 
     timer_cb = EpochTimerCallback()
     callbacks = [LatestCheckpointCallback(), timer_cb]

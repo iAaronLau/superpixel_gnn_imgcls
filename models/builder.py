@@ -15,6 +15,7 @@ def build_model(args, num_classes: int, node_feature_dim: int | None = None):
             num_classes=num_classes,
             cifar_stem=cifar_stem,
             dropout=args.dropout,
+            resnet_name=getattr(args, "resnet_name", "resnet18"),
         )
 
     if node_feature_dim is None:
