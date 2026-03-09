@@ -53,7 +53,7 @@ def _seed_worker(worker_id: int):
 def parse_args():
     parser = argparse.ArgumentParser(description="Superpixel GNN Image Classification")
 
-    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "imagewoof"])
+    parser.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "imagewoof", "imagenette2"])
     parser.add_argument(
         "--model",
         type=str,

@@ -2,7 +2,7 @@
 
 source ./slurm/functional.sh
 
-JOB_NAME="spgnn-cifar10-gcn"
+JOB_NAME="spgnn-cifar10-gat"
 PARTITION_NAME=${PARTITION_NAME:-ouyqcobre_el9}
 GPUS_PER_NODE=${GPUS_PER_NODE:-1}
 NODES=${NODES:-1}
@@ -11,9 +11,9 @@ RUNTIME_ENV_LINES="export WANDB_MODE=online"
 
 SCRIPT=$(cat <<'EOF'
 train.py --dataset cifar10 
-        --model gcn 
+        --model gat 
         --train_backend transformers 
-        --n_segments 200 
+        --n_segments 100 
         --use_xy 1 
         --image_size 64 
         --batch_size 128 
@@ -28,7 +28,7 @@ train.py --dataset cifar10
         --cache_dir graph_cache 
         --use_wandb 1 
         --wandb_project superpixel-gnn-imgcls 
-        --run_name cifar10_gcn_seg200_xy1_final
+        --run_name cifar10_gat_seg100_xy1_final
 EOF
 )
 

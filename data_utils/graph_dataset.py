@@ -152,15 +152,33 @@ class HFGraphDataset(Dataset):
             except TypeError:
                 return torch.load(self.cache_path, map_location="cpu")
 
+        def _load_cache_or_none():
+            if not os.path.exists(self.cache_path):
+                return None
+            try:
+                graphs = _load_cache()
+            except Exception as exc:  # noqa: PERF203
+                print(f"[Cache] invalid graph cache, rebuilding: {self.cache_path} ({exc})")
+                try:
+                    os.remove(self.cache_path)
+                except OSError:
+                    pass
+                return None
+            return graphs
+
         if self.use_cache and os.path.exists(self.cache_path):
-            self.graphs = _load_cache()
-            return
+            cached = _load_cache_or_none()
+            if cached is not None:
+                self.graphs = cached
+                return
 
         if self.use_cache:
             os.makedirs(self.cache_dir, exist_ok=True)
             lock_path = f"{self.cache_path}.lock"
             lock_acquired = False
             lock_wait_sec = 0
+            max_lock_wait_sec = 7200
+            log_wait_every_sec = 60
 
             while not lock_acquired:
                 try:
@@ -168,17 +186,37 @@ class HFGraphDataset(Dataset):
                     os.close(fd)
                     lock_acquired = True
                 except FileExistsError:
-                    if os.path.exists(self.cache_path):
-                        self.graphs = _load_cache()
+                    cached = _load_cache_or_none()
+                    if cached is not None:
+                        self.graphs = cached
                         return
                     time.sleep(1.0)
                     lock_wait_sec += 1
-                    if lock_wait_sec > 7200:
+                    if lock_wait_sec % log_wait_every_sec == 0:
+                        print(
+                            f"[Cache] waiting on lock for {self.split_name}: "
+                            f"{self.cache_path} waited={lock_wait_sec}s"
+                        )
+                    if lock_wait_sec > max_lock_wait_sec:
+                        # Best effort cleanup for stale lock files left by killed jobs.
+                        try:
+                            lock_age = time.time() - os.path.getmtime(lock_path)
+                        except OSError:
+                            lock_age = 0.0
+                        if lock_age > max_lock_wait_sec:
+                            print(f"[Cache] removing stale lock: {lock_path}")
+                            try:
+                                os.remove(lock_path)
+                            except OSError:
+                                pass
+                            lock_wait_sec = 0
+                            continue
                         raise TimeoutError(f"Waited too long for graph cache lock: {lock_path}")
 
             try:
-                if os.path.exists(self.cache_path):
-                    self.graphs = _load_cache()
+                cached = _load_cache_or_none()
+                if cached is not None:
+                    self.graphs = cached
                     return
 
                 graphs = []
@@ -192,7 +230,16 @@ class HFGraphDataset(Dataset):
                     graphs.append(graph)
 
                 self.graphs = graphs
-                torch.save(self.graphs, self.cache_path)
+                tmp_cache_path = f"{self.cache_path}.tmp.{os.getpid()}.{time.time_ns()}"
+                try:
+                    torch.save(self.graphs, tmp_cache_path)
+                    os.replace(tmp_cache_path, self.cache_path)
+                finally:
+                    if os.path.exists(tmp_cache_path):
+                        try:
+                            os.remove(tmp_cache_path)
+                        except OSError:
+                            pass
             finally:
                 if os.path.exists(lock_path):
                     os.remove(lock_path)

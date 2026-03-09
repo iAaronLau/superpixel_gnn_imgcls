@@ -4,7 +4,7 @@ Runnable baseline for image classification with:
 
 - CNN baseline (`resnet`)
 - Superpixel graph models (`gcn`, `gat`, `graph_transformer`)
-- Datasets from HuggingFace (`cifar10`, `imagewoof`)
+- Datasets from HuggingFace/local image folders (`cifar10`, `imagewoof`, `imagenette2`)
 - Two training backends: `accelerate` and `transformers.Trainer`
 - Default training backend: `transformers.Trainer` (HF ecosystem first)
 - Optional logging with `wandb`
@@ -96,6 +96,7 @@ Prebuilt scripts:
 
 - `batch_train_cifar10_resnet.conda.sh`
 - `batch_train_cifar10_gcn.conda.sh`
+- `batch_train_cifar10_gat.conda.sh`
 - `batch_train_imagewoof_gat.conda.sh`
 
 Common helper:

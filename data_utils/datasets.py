@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Tuple
 
-from datasets import ClassLabel, Dataset, DatasetDict, Image as HFImage, load_dataset
+from datasets import ClassLabel, Dataset, DatasetDict, Features, Image as HFImage, load_dataset
 
 
 @dataclass
@@ -16,7 +17,11 @@ class DatasetBundle:
     source_name: str
 
 
-DATASET_CANDIDATES = {
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+IMAGENET_STYLE_DATASETS = {"imagewoof", "imagenette2"}
+
+REMOTE_DATASET_CANDIDATES = {
     "cifar10": [
         ("cifar10", None),
     ],
@@ -29,9 +34,97 @@ DATASET_CANDIDATES = {
 }
 
 
+LOCAL_DATASET_DIR_CANDIDATES = {
+    "imagewoof": ["imagewoof2", "imagewoof"],
+    "imagenette2": ["imagenette2", "imagenette2-320", "imagenette2-160"],
+}
+
+
+def _local_data_roots() -> list[Path]:
+    roots = []
+    for root in [PROJECT_ROOT / "data" / "hf_cache", PROJECT_ROOT / "data"]:
+        if root.exists():
+            roots.append(root)
+    return roots
+
+
+def _resolve_local_dataset_root(dataset_name: str) -> Path | None:
+    for base_root in _local_data_roots():
+        for candidate_name in LOCAL_DATASET_DIR_CANDIDATES.get(dataset_name, []):
+            candidate_root = base_root / candidate_name
+            if candidate_root.is_dir() and (candidate_root / "train").is_dir():
+                return candidate_root
+    return None
+
+
+def _iter_image_paths(class_dir: Path) -> list[str]:
+    image_paths = []
+    for path in sorted(class_dir.rglob("*")):
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+            image_paths.append(str(path))
+    return image_paths
+
+
+def _build_local_imagefolder_split(split_dir: Path, class_names: list[str]) -> Dataset:
+    image_paths: list[str] = []
+    labels: list[int] = []
+    class_to_idx = {name: idx for idx, name in enumerate(class_names)}
+
+    for class_name in class_names:
+        class_dir = split_dir / class_name
+        if not class_dir.is_dir():
+            continue
+        class_image_paths = _iter_image_paths(class_dir)
+        image_paths.extend(class_image_paths)
+        labels.extend([class_to_idx[class_name]] * len(class_image_paths))
+
+    if not image_paths:
+        raise RuntimeError(f"No image files found under local dataset split: {split_dir}")
+
+    features = Features(
+        {
+            "image": HFImage(),
+            "label": ClassLabel(names=class_names),
+        }
+    )
+    return Dataset.from_dict({"image": image_paths, "label": labels}, features=features)
+
+
+def _load_local_imagefolder_dataset(dataset_name: str) -> Tuple[DatasetDict, str] | None:
+    dataset_root = _resolve_local_dataset_root(dataset_name)
+    if dataset_root is None:
+        return None
+
+    split_dirs = {path.name: path for path in dataset_root.iterdir() if path.is_dir()}
+    train_dir = split_dirs.get("train")
+    if train_dir is None:
+        raise RuntimeError(f"Local dataset root is missing a train split: {dataset_root}")
+
+    class_names = sorted(path.name for path in train_dir.iterdir() if path.is_dir())
+    if not class_names:
+        raise RuntimeError(f"No class directories found under: {train_dir}")
+
+    dataset_splits = {"train": _build_local_imagefolder_split(train_dir, class_names)}
+
+    for split_name in ("val", "validation", "test"):
+        split_dir = split_dirs.get(split_name)
+        if split_dir is not None:
+            dataset_splits[split_name] = _build_local_imagefolder_split(split_dir, class_names)
+
+    return DatasetDict(dataset_splits), f"local_imagefolder:{dataset_root}"
+
+
 def _load_dataset_with_fallback(dataset_name: str) -> Tuple[DatasetDict, str]:
-    candidates = DATASET_CANDIDATES.get(dataset_name, [(dataset_name, None)])
     errors = []
+
+    try:
+        local_dataset = _load_local_imagefolder_dataset(dataset_name)
+        if local_dataset is not None:
+            return local_dataset
+    except Exception as exc:  # noqa: PERF203
+        errors.append(f"local:{dataset_name} -> {exc}")
+
+    candidates = REMOTE_DATASET_CANDIDATES.get(dataset_name, [(dataset_name, None)])
     for repo_id, config_name in candidates:
         try:
             if config_name is None:
@@ -111,7 +204,7 @@ def load_dataset_bundle(dataset_name: str, seed: int, cifar_val_size: int = 5000
             raise RuntimeError("CIFAR-10 requires an official test split, but none was found.")
         train_split, val_split = _split_train_val(train_split, seed=seed, val_size=cifar_val_size)
         test_split = ds["test"]
-    elif dataset_name == "imagewoof":
+    elif dataset_name in IMAGENET_STYLE_DATASETS:
         val_like = ds.get("validation", ds.get("val"))
         test_like = ds.get("test")
 

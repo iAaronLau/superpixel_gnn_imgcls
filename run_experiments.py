@@ -15,6 +15,11 @@ from typing import Iterable
 
 
 GRAPH_MODELS = {"gcn", "gat", "graph_transformer"}
+IMAGENET_STYLE_DATASETS = {"imagewoof", "imagenette2"}
+DOWNSTREAM_GROUP_IDS = {
+    "imagewoof": ("9a", "9b"),
+    "imagenette2": ("10a", "10b"),
+}
 FINAL_RE = re.compile(
     r"best_val_acc=([0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)\s+test_acc=([0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)"
 )
@@ -82,6 +87,18 @@ def parse_int_grid(raw: str) -> list[int]:
     return values
 
 
+def parse_str_grid(raw: str) -> list[str]:
+    values = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        values.append(token)
+    if not values:
+        raise ValueError("Empty str grid")
+    return values
+
+
 def append_sweep_row(csv_path: Path, row: RunRecord) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     exists = csv_path.exists()
@@ -120,6 +137,28 @@ def read_last_results_row(results_csv: Path) -> dict | None:
     return rows[-1]
 
 
+def has_completed_results(results_csv: Path) -> bool:
+    if not results_csv.exists():
+        return False
+    with results_csv.open("r", newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            val = str(row.get("val_acc", "")).strip()
+            test = str(row.get("test_acc", "")).strip()
+            if val and test:
+                return True
+    return False
+
+
+def has_success_in_sweep_log(sweep_log_csv: Path, run_name: str) -> bool:
+    if not sweep_log_csv.exists():
+        return False
+    with sweep_log_csv.open("r", newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row.get("run_name") == run_name and row.get("status") == "success":
+                return True
+    return False
+
+
 def should_skip_batch(spec: ExperimentSpec, batch_size: int, args) -> tuple[bool, str]:
     if spec.model not in GRAPH_MODELS:
         return False, ""
@@ -127,8 +166,10 @@ def should_skip_batch(spec: ExperimentSpec, batch_size: int, args) -> tuple[bool
     if spec.dataset == "cifar10" and batch_size > args.max_graph_batch_cifar:
         return True, f"graph model on CIFAR-10: batch_size>{args.max_graph_batch_cifar}"
 
-    if spec.dataset == "imagewoof" and batch_size > args.max_graph_batch_imagewoof:
-        return True, f"graph model on Imagewoof: batch_size>{args.max_graph_batch_imagewoof}"
+    if spec.dataset in IMAGENET_STYLE_DATASETS:
+        limit = max_graph_batch_for_dataset(args, spec.dataset)
+        if batch_size > limit:
+            return True, f"graph model on {spec.dataset}: batch_size>{limit}"
 
     return False, ""
 
@@ -287,26 +328,51 @@ def build_cifar_specs(args) -> list[ExperimentSpec]:
     ]
 
 
-def build_imagewoof_specs(args, best_graph_model: str, best_graph_use_xy: int) -> list[ExperimentSpec]:
+def epochs_for_dataset(args, dataset_name: str) -> int:
+    if dataset_name == "cifar10":
+        return args.cifar_epochs
+    if dataset_name == "imagewoof":
+        return args.imagewoof_epochs
+    if dataset_name == "imagenette2":
+        return args.imagenette2_epochs
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+
+def max_graph_batch_for_dataset(args, dataset_name: str) -> int:
+    if dataset_name == "cifar10":
+        return args.max_graph_batch_cifar
+    if dataset_name == "imagewoof":
+        return args.max_graph_batch_imagewoof
+    if dataset_name == "imagenette2":
+        return args.max_graph_batch_imagenette2
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+
+def build_downstream_specs(args, dataset_name: str, best_graph_model: str, best_graph_use_xy: int) -> list[ExperimentSpec]:
+    if dataset_name not in DOWNSTREAM_GROUP_IDS:
+        raise ValueError(f"Unsupported downstream dataset: {dataset_name}")
+
+    resnet_group_id, graph_group_id = DOWNSTREAM_GROUP_IDS[dataset_name]
+    dataset_note = dataset_name.capitalize()
     return [
         ExperimentSpec(
-            group_id="9a",
-            dataset="imagewoof",
+            group_id=resnet_group_id,
+            dataset=dataset_name,
             model="resnet",
             image_size=224,
-            epochs=args.imagewoof_epochs,
+            epochs=epochs_for_dataset(args, dataset_name),
             resnet_name="resnet18",
-            note="Imagewoof baseline",
+            note=f"{dataset_note} baseline",
         ),
         ExperimentSpec(
-            group_id="9b",
-            dataset="imagewoof",
+            group_id=graph_group_id,
+            dataset=dataset_name,
             model=best_graph_model,
             image_size=224,
-            epochs=args.imagewoof_epochs,
+            epochs=epochs_for_dataset(args, dataset_name),
             n_segments=100,
             use_xy=best_graph_use_xy,
-            note="Imagewoof with best CIFAR graph model",
+            note=f"{dataset_note} with best CIFAR graph model",
         ),
     ]
 
@@ -353,6 +419,32 @@ def run_grid_for_spec(
                     )
                     append_sweep_row(sweep_log_csv, rec)
                     print(f"[Skip] {run_name}: {reason}")
+                    continue
+
+                if args.skip_completed and (
+                    has_success_in_sweep_log(sweep_log_csv, run_name)
+                    or has_completed_results(Path(args.output_dir) / run_name / "results.csv")
+                ):
+                    rec = RunRecord(
+                        group_id=spec.group_id,
+                        run_name=run_name,
+                        status="skipped_completed",
+                        attempts=0,
+                        lr=lr,
+                        batch_size=batch_size,
+                        weight_decay=weight_decay,
+                        dataset=spec.dataset,
+                        model=spec.model,
+                        n_segments="-" if spec.n_segments is None else str(spec.n_segments),
+                        use_xy="-" if spec.use_xy is None else str(spec.use_xy),
+                        val_acc="",
+                        test_acc="",
+                        elapsed_sec=0.0,
+                        log_file="",
+                        note="results.csv already present",
+                    )
+                    append_sweep_row(sweep_log_csv, rec)
+                    print(f"[Skip] completed run: {run_name}")
                     continue
 
                 if args.skip_existing and run_dir.exists() and (run_dir / "config.json").exists():
@@ -535,6 +627,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--cifar_epochs", type=int, default=50)
     p.add_argument("--imagewoof_epochs", type=int, default=20)
+    p.add_argument("--imagenette2_epochs", type=int, default=-1)
 
     p.add_argument("--lr_grid", type=str, default="3e-4,1e-3")
     p.add_argument("--batch_size_grid", type=str, default="16,32,64")
@@ -542,6 +635,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--max_graph_batch_cifar", type=int, default=64)
     p.add_argument("--max_graph_batch_imagewoof", type=int, default=16)
+    p.add_argument("--max_graph_batch_imagenette2", type=int, default=-1)
+    p.add_argument("--downstream_datasets", type=str, default="imagewoof")
 
     p.add_argument("--use_cache", type=int, default=1)
     p.add_argument("--cache_dir", type=str, default="graph_cache")
@@ -556,7 +651,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--save_steps", type=int, default=0)
     p.add_argument("--checkpoints_total_limit", type=int, default=3)
 
-    p.add_argument("--skip_existing", type=int, default=1)
+    p.add_argument("--skip_completed", type=int, default=1)
+    p.add_argument("--skip_existing", type=int, default=0)
     p.add_argument("--retries", type=int, default=1)
     p.add_argument("--retry_sleep_sec", type=int, default=15)
     p.add_argument("--max_runs", type=int, default=-1)
@@ -577,6 +673,19 @@ def main() -> None:
     args.lr_values = parse_float_grid(args.lr_grid)
     args.batch_sizes = parse_int_grid(args.batch_size_grid)
     args.weight_decays = parse_float_grid(args.weight_decay_grid)
+    args.downstream_datasets_list = parse_str_grid(args.downstream_datasets)
+
+    if args.imagenette2_epochs <= 0:
+        args.imagenette2_epochs = args.imagewoof_epochs
+    if args.max_graph_batch_imagenette2 <= 0:
+        args.max_graph_batch_imagenette2 = args.max_graph_batch_imagewoof
+
+    unsupported = [name for name in args.downstream_datasets_list if name not in IMAGENET_STYLE_DATASETS]
+    if unsupported:
+        raise ValueError(
+            f"Unsupported downstream dataset(s): {unsupported}. "
+            f"Choices: {sorted(IMAGENET_STYLE_DATASETS)}"
+        )
 
     results_csv = Path(args.results_csv)
     sweep_log_csv = Path(args.sweep_log_csv)
@@ -595,12 +704,15 @@ def main() -> None:
 
     best_graph_model, best_graph_use_xy = choose_best_graph_candidate(args, graph_candidates)
 
-    imagewoof_specs = build_imagewoof_specs(args, best_graph_model, best_graph_use_xy)
-    planned_imagewoof = plan_total_runs(imagewoof_specs, args)
-    print(f"[Sweep] Planned Imagewoof runs (before max_runs): {planned_imagewoof}")
+    for dataset_name in args.downstream_datasets_list:
+        downstream_specs = build_downstream_specs(args, dataset_name, best_graph_model, best_graph_use_xy)
+        planned_downstream = plan_total_runs(downstream_specs, args)
+        print(f"[Sweep] Planned {dataset_name} runs (before max_runs): {planned_downstream}")
 
-    for spec in imagewoof_specs:
-        stop = run_grid_for_spec(args, spec, sweep_log_csv, results_csv, graph_candidates, counters)
+        for spec in downstream_specs:
+            stop = run_grid_for_spec(args, spec, sweep_log_csv, results_csv, graph_candidates, counters)
+            if stop:
+                break
         if stop:
             break
 
