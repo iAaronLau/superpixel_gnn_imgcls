@@ -633,8 +633,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch_size_grid", type=str, default="16,32,64")
     p.add_argument("--weight_decay_grid", type=str, default="1e-4")
 
-    p.add_argument("--max_graph_batch_cifar", type=int, default=64)
-    p.add_argument("--max_graph_batch_imagewoof", type=int, default=16)
+    p.add_argument("--max_graph_batch_cifar", type=int, default=128)
+    p.add_argument("--max_graph_batch_imagewoof", type=int, default=128)
     p.add_argument("--max_graph_batch_imagenette2", type=int, default=-1)
     p.add_argument("--downstream_datasets", type=str, default="imagewoof")
 

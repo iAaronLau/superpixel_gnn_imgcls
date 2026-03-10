@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 from torch_geometric.data import Batch as PyGBatch
 
-from data_utils.graph_dataset import GraphBuildConfig, HFGraphDataset
+from data_utils.graph_dataset import GraphAugmentConfig, GraphBuildConfig, HFGraphDataset
 from data_utils.image_dataset import HFImageDictDataset, build_image_transform
 from models import build_model
 from utils.checkpoint import update_latest_symlink
@@ -60,13 +60,14 @@ class SuperpixelConfig(PretrainedConfig):
         image_size: int = 64,
         num_labels: int = 10,
         node_feature_dim: int = 5,
+        edge_feature_dim: int = 0,
         resnet_name: str = "resnet18",
         channels_last: bool = True,
-        hidden_dim: int = 128,
-        gnn_layers: int = 3,
-        gat_heads: int = 4,
+        hidden_dim: int = 256,
+        gnn_layers: int = 4,
+        gat_heads: int = 8,
         dropout: float = 0.2,
-        pooling: str = "mean",
+        pooling: str = "meanmax",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -75,6 +76,7 @@ class SuperpixelConfig(PretrainedConfig):
         self.image_size = image_size
         self.num_labels = num_labels
         self.node_feature_dim = node_feature_dim
+        self.edge_feature_dim = edge_feature_dim
         self.resnet_name = resnet_name
         self.channels_last = channels_last
         self.hidden_dim = hidden_dim
@@ -102,7 +104,13 @@ class SuperpixelForImageClassification(PreTrainedModel):
             pooling=config.pooling,
         )
         node_feature_dim = None if config.model_name == "resnet" else config.node_feature_dim
-        self.backbone = build_model(args=args, num_classes=config.num_labels, node_feature_dim=node_feature_dim)
+        edge_feature_dim = None if config.model_name == "resnet" else config.edge_feature_dim
+        self.backbone = build_model(
+            args=args,
+            num_classes=config.num_labels,
+            node_feature_dim=node_feature_dim,
+            edge_feature_dim=edge_feature_dim,
+        )
         self.post_init()
 
     def forward(self, pixel_values=None, graph_data=None, labels=None, **kwargs):
@@ -279,6 +287,21 @@ def build_trainer_datasets(args, bundle):
         use_xy=bool(args.use_xy),
         compactness=args.slic_compactness,
         sigma=args.slic_sigma,
+        include_rgb_stats=bool(args.graph_include_rgb_stats),
+        include_hsv_stats=bool(args.graph_include_hsv_stats),
+        include_lab_stats=bool(args.graph_include_lab_stats),
+        include_shape_stats=bool(args.graph_include_shape_stats),
+        include_patch_features=bool(args.graph_include_patch_features),
+        patch_embed_size=args.graph_patch_embed_size,
+        mask_patch_background=bool(args.graph_mask_patch_background),
+        cache_version=args.graph_cache_version,
+    )
+    augment_cfg = GraphAugmentConfig(
+        node_drop_prob=args.graph_node_drop_prob,
+        edge_drop_prob=args.graph_edge_drop_prob,
+        feature_mask_prob=args.graph_feature_mask_prob,
+        feature_noise_std=args.graph_feature_noise_std,
+        edge_noise_std=args.graph_edge_noise_std,
     )
 
     train_ds = HFGraphDataset(
@@ -290,6 +313,8 @@ def build_trainer_datasets(args, bundle):
         graph_cfg=graph_cfg,
         use_cache=bool(args.use_cache),
         cache_dir=args.cache_dir,
+        cache_version=args.graph_cache_version,
+        augment_cfg=augment_cfg,
     )
     val_ds = HFGraphDataset(
         bundle.splits["val"],
@@ -300,6 +325,7 @@ def build_trainer_datasets(args, bundle):
         graph_cfg=graph_cfg,
         use_cache=bool(args.use_cache),
         cache_dir=args.cache_dir,
+        cache_version=args.graph_cache_version,
     )
     test_ds = HFGraphDataset(
         bundle.splits["test"],
@@ -310,17 +336,20 @@ def build_trainer_datasets(args, bundle):
         graph_cfg=graph_cfg,
         use_cache=bool(args.use_cache),
         cache_dir=args.cache_dir,
+        cache_version=args.graph_cache_version,
     )
 
-    node_feature_dim = 5 if args.use_xy else 3
-    return train_ds, val_ds, test_ds, node_feature_dim, graph_data_collator
+    node_feature_dim, edge_feature_dim = train_ds.feature_dims()
+    return train_ds, val_ds, test_ds, node_feature_dim, edge_feature_dim, graph_data_collator
 
 
-def _build_hf_config(args, bundle, node_feature_dim: int | None) -> SuperpixelConfig:
+def _build_hf_config(args, bundle, node_feature_dim: int | None, edge_feature_dim: int | None) -> SuperpixelConfig:
     if args.model == "resnet":
         node_dim = 0
+        edge_dim = 0
     else:
-        node_dim = node_feature_dim if node_feature_dim is not None else (5 if args.use_xy else 3)
+        node_dim = node_feature_dim if node_feature_dim is not None else 0
+        edge_dim = edge_feature_dim if edge_feature_dim is not None else 0
 
     return SuperpixelConfig(
         model_name=args.model,
@@ -328,6 +357,7 @@ def _build_hf_config(args, bundle, node_feature_dim: int | None) -> SuperpixelCo
         image_size=args.image_size,
         num_labels=bundle.num_classes,
         node_feature_dim=node_dim,
+        edge_feature_dim=edge_dim,
         resnet_name=getattr(args, "resnet_name", "resnet18"),
         channels_last=bool(getattr(args, "channels_last", 1)),
         hidden_dim=args.hidden_dim,
@@ -350,9 +380,9 @@ def run_transformers_training(args, bundle, run_dir: str):
         os.environ.setdefault("WANDB_NAME", args.run_name)
         os.environ.setdefault("WANDB_MODE", args.wandb_mode)
 
-    train_ds, val_ds, test_ds, node_feature_dim, data_collator = build_trainer_datasets(args, bundle)
+    train_ds, val_ds, test_ds, node_feature_dim, edge_feature_dim, data_collator = build_trainer_datasets(args, bundle)
 
-    config = _build_hf_config(args, bundle, node_feature_dim)
+    config = _build_hf_config(args, bundle, node_feature_dim, edge_feature_dim)
     model = SuperpixelForImageClassification(config)
     if args.model == "resnet" and bool(getattr(args, "channels_last", 1)):
         model = model.to(memory_format=torch.channels_last)

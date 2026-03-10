@@ -6,7 +6,12 @@ from .graph_transformer import GraphTransformerClassifier
 from .resnet import ResNetBaseline
 
 
-def build_model(args, num_classes: int, node_feature_dim: int | None = None):
+def build_model(
+    args,
+    num_classes: int,
+    node_feature_dim: int | None = None,
+    edge_feature_dim: int | None = None,
+):
     model_name = args.model.lower()
 
     if model_name == "resnet":
@@ -26,6 +31,7 @@ def build_model(args, num_classes: int, node_feature_dim: int | None = None):
             in_channels=node_feature_dim,
             hidden_channels=args.hidden_dim,
             num_classes=num_classes,
+            edge_dim=edge_feature_dim,
             num_layers=args.gnn_layers,
             dropout=args.dropout,
             pooling=args.pooling,
@@ -35,6 +41,7 @@ def build_model(args, num_classes: int, node_feature_dim: int | None = None):
             in_channels=node_feature_dim,
             hidden_channels=args.hidden_dim,
             num_classes=num_classes,
+            edge_dim=edge_feature_dim,
             num_layers=args.gnn_layers,
             heads=args.gat_heads,
             dropout=args.dropout,
@@ -45,6 +52,7 @@ def build_model(args, num_classes: int, node_feature_dim: int | None = None):
             in_channels=node_feature_dim,
             hidden_channels=args.hidden_dim,
             num_classes=num_classes,
+            edge_dim=edge_feature_dim,
             num_layers=args.gnn_layers,
             heads=args.gat_heads,
             dropout=args.dropout,

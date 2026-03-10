@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from torch_geometric.loader import DataLoader as PyGDataLoader
 
 from data_utils.datasets import DatasetBundle, load_dataset_bundle
-from data_utils.graph_dataset import GraphBuildConfig, HFGraphDataset
+from data_utils.graph_dataset import GraphAugmentConfig, GraphBuildConfig, HFGraphDataset
 from data_utils.image_dataset import HFImageDataset, build_image_transform
 from models import build_model
 from utils.checkpoint import load_checkpoint, save_checkpoint, update_latest_symlink
@@ -75,12 +75,12 @@ def parse_args():
     parser.add_argument("--scheduler", type=str, default="none", choices=["none", "cosine", "step"])
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
 
-    parser.add_argument("--hidden_dim", type=int, default=128)
-    parser.add_argument("--gnn_layers", type=int, default=3)
-    parser.add_argument("--gat_heads", type=int, default=4)
+    parser.add_argument("--hidden_dim", type=int, default=256)
+    parser.add_argument("--gnn_layers", type=int, default=4)
+    parser.add_argument("--gat_heads", type=int, default=8)
     parser.add_argument("--resnet_name", type=str, default="resnet18", choices=["resnet18", "resnet34"])
     parser.add_argument("--dropout", type=float, default=0.2)
-    parser.add_argument("--pooling", type=str, default="mean", choices=["mean", "add"])
+    parser.add_argument("--pooling", type=str, default="meanmax", choices=["mean", "add", "meanmax"])
     parser.add_argument("--grad_clip", type=float, default=0.0)
 
     parser.add_argument("--num_workers", type=int, default=4)
@@ -102,6 +102,19 @@ def parse_args():
 
     parser.add_argument("--use_cache", type=int, default=1)
     parser.add_argument("--cache_dir", type=str, default="graph_cache")
+    parser.add_argument("--graph_cache_version", type=str, default="v3")
+    parser.add_argument("--graph_include_rgb_stats", type=int, default=1)
+    parser.add_argument("--graph_include_hsv_stats", type=int, default=1)
+    parser.add_argument("--graph_include_lab_stats", type=int, default=1)
+    parser.add_argument("--graph_include_shape_stats", type=int, default=1)
+    parser.add_argument("--graph_include_patch_features", type=int, default=1)
+    parser.add_argument("--graph_patch_embed_size", type=int, default=4)
+    parser.add_argument("--graph_mask_patch_background", type=int, default=1)
+    parser.add_argument("--graph_node_drop_prob", type=float, default=0.05)
+    parser.add_argument("--graph_edge_drop_prob", type=float, default=0.10)
+    parser.add_argument("--graph_feature_mask_prob", type=float, default=0.05)
+    parser.add_argument("--graph_feature_noise_std", type=float, default=0.02)
+    parser.add_argument("--graph_edge_noise_std", type=float, default=0.01)
 
     parser.add_argument("--output_dir", type=str, default="outputs")
     parser.add_argument("--resume", type=str, default="")
@@ -235,6 +248,21 @@ def build_dataloaders(args, bundle: DatasetBundle):
         use_xy=bool(args.use_xy),
         compactness=args.slic_compactness,
         sigma=args.slic_sigma,
+        include_rgb_stats=bool(args.graph_include_rgb_stats),
+        include_hsv_stats=bool(args.graph_include_hsv_stats),
+        include_lab_stats=bool(args.graph_include_lab_stats),
+        include_shape_stats=bool(args.graph_include_shape_stats),
+        include_patch_features=bool(args.graph_include_patch_features),
+        patch_embed_size=args.graph_patch_embed_size,
+        mask_patch_background=bool(args.graph_mask_patch_background),
+        cache_version=args.graph_cache_version,
+    )
+    augment_cfg = GraphAugmentConfig(
+        node_drop_prob=args.graph_node_drop_prob,
+        edge_drop_prob=args.graph_edge_drop_prob,
+        feature_mask_prob=args.graph_feature_mask_prob,
+        feature_noise_std=args.graph_feature_noise_std,
+        edge_noise_std=args.graph_edge_noise_std,
     )
 
     train_ds = HFGraphDataset(
@@ -246,6 +274,8 @@ def build_dataloaders(args, bundle: DatasetBundle):
         graph_cfg=graph_cfg,
         use_cache=bool(args.use_cache),
         cache_dir=args.cache_dir,
+        cache_version=args.graph_cache_version,
+        augment_cfg=augment_cfg,
     )
     val_ds = HFGraphDataset(
         bundle.splits["val"],
@@ -256,6 +286,7 @@ def build_dataloaders(args, bundle: DatasetBundle):
         graph_cfg=graph_cfg,
         use_cache=bool(args.use_cache),
         cache_dir=args.cache_dir,
+        cache_version=args.graph_cache_version,
     )
     test_ds = HFGraphDataset(
         bundle.splits["test"],
@@ -266,6 +297,7 @@ def build_dataloaders(args, bundle: DatasetBundle):
         graph_cfg=graph_cfg,
         use_cache=bool(args.use_cache),
         cache_dir=args.cache_dir,
+        cache_version=args.graph_cache_version,
     )
 
     train_loader = PyGDataLoader(
@@ -287,8 +319,8 @@ def build_dataloaders(args, bundle: DatasetBundle):
         **common_kwargs,
     )
 
-    node_feature_dim = 5 if args.use_xy else 3
-    return train_loader, val_loader, test_loader, node_feature_dim
+    node_feature_dim, edge_feature_dim = train_ds.feature_dims()
+    return train_loader, val_loader, test_loader, node_feature_dim, edge_feature_dim
 
 
 def create_scheduler(args, optimizer):
@@ -469,9 +501,14 @@ def run_accelerate_training(args, bundle: DatasetBundle, run_dir: str):
             print(f"[WARN] wandb init failed, disable logging: {exc}")
             wandb_run = None
 
-    train_loader, val_loader, test_loader, node_feature_dim = build_dataloaders(args, bundle)
+    train_loader, val_loader, test_loader, node_feature_dim, edge_feature_dim = build_dataloaders(args, bundle)
 
-    model = build_model(args, num_classes=bundle.num_classes, node_feature_dim=node_feature_dim)
+    model = build_model(
+        args,
+        num_classes=bundle.num_classes,
+        node_feature_dim=node_feature_dim,
+        edge_feature_dim=edge_feature_dim,
+    )
     use_channels_last = bool(args.channels_last) and args.model == "resnet"
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)
