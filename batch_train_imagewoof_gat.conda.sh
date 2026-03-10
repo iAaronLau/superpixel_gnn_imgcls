@@ -3,7 +3,7 @@
 source ./slurm/functional.sh
 
 JOB_NAME="spgnn-imagewoof-gat"
-PARTITION_NAME=${PARTITION_NAME:-ouyqcobre_el9}
+PARTITION_NAME=${PARTITION_NAME:-ouyqcobre_el9,el9_gpu_test}
 GPUS_PER_NODE=${GPUS_PER_NODE:-1}
 NODES=${NODES:-1}
 CPUS_PER_TASK=${CPUS_PER_TASK:-16}
@@ -17,21 +17,19 @@ train.py --dataset imagewoof
         --n_segments 100 
         --use_xy 1 
         --image_size 224 
-        --batch_size 32 
-        --epochs 40 
-        --lr 3e-4 
+        --batch_size 128 
+        --epochs 30 
+        --lr 1e-3 
+        --weight_decay 1e-4 
+        --seed 42 
         --scheduler cosine 
         --mixed_precision bf16 
         --num_workers 8 
         --use_cache 1 
         --cache_dir graph_cache 
-        --eval_strategy steps 
-        --eval_steps 200 
-        --save_strategy steps 
-        --save_steps 200 
         --use_wandb 1 
         --wandb_project superpixel-gnn-imgcls 
-        --run_name imagewoof_gat_tf
+        --run_name imagewoof_gat_seg100_xy1_final
 EOF
 )
 
