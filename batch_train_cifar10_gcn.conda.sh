@@ -15,11 +15,11 @@ train.py --dataset cifar10
         --train_backend transformers 
         --n_segments 200 
         --use_xy 1 
-        --hidden_dim 256 
+        --hidden_dim 384 
         --gnn_layers 4 
         --dropout 0.1 
         --pooling meanmax 
-        --slic_compactness 20 
+        --slic_compactness 10 
         --image_size 64 
         --batch_size 128 
         --epochs 30 
@@ -29,6 +29,10 @@ train.py --dataset cifar10
         --scheduler cosine 
         --mixed_precision bf16 
         --num_workers 8 
+        --allow_tf32 1 
+        --cudnn_benchmark 1 
+        --torch_compile 0 
+        --torch_compile_mode reduce-overhead 
         --use_cache 1 
         --cache_dir graph_cache 
         --graph_cache_version v3 
@@ -39,7 +43,7 @@ train.py --dataset cifar10
         --graph_edge_noise_std 0.01 
         --use_wandb 1 
         --wandb_project superpixel-gnn-imgcls 
-        --run_name cifar10_gcn_seg200_xy1_final
+        --run_name cifar10_gcn_seg200_xy1_hd384_final
 EOF
 )
 

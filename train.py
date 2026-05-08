@@ -174,6 +174,23 @@ def configure_torch_runtime(args):
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
 
+    disable_graph_cudagraphs = os.getenv("SPGNN_DISABLE_GRAPH_CUDAGRAPHS", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+    if args.model in GRAPH_MODELS and disable_graph_cudagraphs:
+        try:
+            import torch._inductor.config as inductor_config
+
+            if hasattr(inductor_config, "triton"):
+                inductor_config.triton.cudagraph_trees = False
+                inductor_config.triton.cudagraph_skip_dynamic_graphs = True
+                inductor_config.triton.cudagraph_dynamic_shape_warn_limit = None
+                print("[Perf] disabled inductor cudagraph trees for dynamic-shape graph batches")
+        except Exception as exc:  # noqa: PERF203
+            print(f"[WARN] failed to configure inductor cudagraph runtime: {exc}")
+
 
 def _subset_split(split: Dataset, max_samples: int, seed: int) -> Dataset:
     if max_samples is None or max_samples < 0 or max_samples >= len(split):

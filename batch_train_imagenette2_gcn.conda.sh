@@ -13,9 +13,9 @@ SCRIPT=$(cat <<'EOF'
 train.py --dataset imagenette2 
         --model gcn 
         --train_backend transformers 
-        --n_segments 100 
-        --use_xy 0 
-        --hidden_dim 256 
+        --n_segments 200 
+        --use_xy 1 
+        --hidden_dim 384 
         --gnn_layers 4 
         --dropout 0.1 
         --pooling meanmax 
@@ -29,6 +29,10 @@ train.py --dataset imagenette2
         --scheduler cosine 
         --mixed_precision bf16 
         --num_workers 8 
+        --allow_tf32 1 
+        --cudnn_benchmark 1 
+        --torch_compile 0 
+        --torch_compile_mode reduce-overhead 
         --use_cache 1 
         --cache_dir graph_cache 
         --graph_cache_version v3 
@@ -39,7 +43,7 @@ train.py --dataset imagenette2
         --graph_edge_noise_std 0.01 
         --use_wandb 1 
         --wandb_project superpixel-gnn-imgcls 
-        --run_name imagenette2_gcn_seg100_xy0_final
+        --run_name imagenette2_gcn_seg200_xy1_hd384_final
 EOF
 )
 

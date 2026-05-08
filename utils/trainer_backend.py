@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import inspect
 import math
 import os
 import time
-import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -216,6 +217,18 @@ class WandbBestCheckpointCallback(TrainerCallback):
         super().__init__()
         self.run_name = run_name
 
+    @staticmethod
+    def _artifact_name(run_name: str, suffix: str = "best-checkpoint", max_len: int = 128) -> str:
+        base = f"{run_name}-{suffix}"
+        if len(base) <= max_len:
+            return base
+
+        digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:10]
+        reserved = len(suffix) + len(digest) + 2
+        prefix_len = max(16, max_len - reserved)
+        prefix = run_name[:prefix_len].rstrip("-_.")
+        return f"{prefix}-{suffix}-{digest}"
+
     def on_train_end(self, args, state, control, **kwargs):
         if hasattr(state, "is_world_process_zero") and not state.is_world_process_zero:
             return control
@@ -231,9 +244,13 @@ class WandbBestCheckpointCallback(TrainerCallback):
         if wandb.run is None:
             return control
 
-        artifact = wandb.Artifact(f"{self.run_name}-best-checkpoint", type="model")
-        artifact.add_dir(state.best_model_checkpoint)
-        wandb.log_artifact(artifact)
+        artifact_name = self._artifact_name(self.run_name)
+        try:
+            artifact = wandb.Artifact(artifact_name, type="model")
+            artifact.add_dir(state.best_model_checkpoint)
+            wandb.log_artifact(artifact)
+        except Exception as exc:  # noqa: PERF203
+            print(f"[WARN] wandb best checkpoint artifact upload skipped: {exc}")
         return control
 
 
@@ -279,7 +296,7 @@ def build_trainer_datasets(args, bundle):
         train_ds = HFImageDictDataset(bundle.splits["train"], bundle.image_key, bundle.label_key, train_t)
         val_ds = HFImageDictDataset(bundle.splits["val"], bundle.image_key, bundle.label_key, eval_t)
         test_ds = HFImageDictDataset(bundle.splits["test"], bundle.image_key, bundle.label_key, eval_t)
-        return train_ds, val_ds, test_ds, None, image_data_collator
+        return train_ds, val_ds, test_ds, None, None, image_data_collator
 
     graph_cfg = GraphBuildConfig(
         image_size=args.image_size,
@@ -457,9 +474,10 @@ def run_transformers_training(args, bundle, run_dir: str):
         hub_strategy=args.hub_strategy,
         hub_token=hub_token,
         torch_compile=bool(getattr(args, "torch_compile", 0)),
-        torch_compile_backend="inductor",
-        torch_compile_mode=getattr(args, "torch_compile_mode", "reduce-overhead"),
     )
+    if bool(getattr(args, "torch_compile", 0)):
+        training_kwargs["torch_compile_backend"] = "inductor"
+        training_kwargs["torch_compile_mode"] = getattr(args, "torch_compile_mode", "reduce-overhead")
 
     def _build_training_args_compatible(kwargs: dict):
         sig = inspect.signature(TrainingArguments.__init__)
